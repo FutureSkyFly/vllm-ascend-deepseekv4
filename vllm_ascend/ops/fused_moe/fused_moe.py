@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -39,7 +41,12 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    reset_input_ids_override,
+    select_experts,
+    set_input_ids_override,
+    zero_experts_compute,
+)
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
@@ -51,6 +58,18 @@ from vllm_ascend.utils import (
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+
+# === DSV4 Prefill double micro-batch + shared expert gate-up-early hooks ===
+_PREFILL_DOUBLE_MB_OVERLAP = os.getenv(
+    "VLLM_ASCEND_PREFILL_DOUBLE_MB_OVERLAP", "0") == "1"
+_PREFILL_DOUBLE_MB_MIN_TOKENS = int(os.getenv(
+    "VLLM_ASCEND_PREFILL_DOUBLE_MB_MIN_TOKENS", "128"))
+_PREFILL_SHARED_EXPERT_GATE_UP_EARLY = os.getenv(
+    "VLLM_ASCEND_PREFILL_SHARED_EXPERT_GATE_UP_EARLY", "0") == "1"
+_PREFILL_SHARED_EXPERT_GATE_UP_EARLY_MIN_TOKENS = int(os.getenv(
+    "VLLM_ASCEND_PREFILL_SHARED_EXPERT_GATE_UP_EARLY_MIN_TOKENS", "128"))
+_PREFILL_DOUBLE_MB_LOGGED = False
+_PREFILL_SHARED_EXPERT_GATE_UP_EARLY_LOGGED = False
 
 
 @dataclass
@@ -729,6 +748,21 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             if evt is not None:
                 torch.npu.current_stream().wait_event(evt)
 
+        # Optional: shared expert gate_up_proj starts *early* (skip the
+        # before_dispatch wait) so it overlaps with the routed-expert AG.
+        num_tokens = hidden_states.shape[0] if hidden_states.dim() >= 1 else 0
+        gate_up_early = (
+            _PREFILL_SHARED_EXPERT_GATE_UP_EARLY
+            and self.multistream_overlap_shared_expert
+            and num_tokens >= _PREFILL_SHARED_EXPERT_GATE_UP_EARLY_MIN_TOKENS)
+        global _PREFILL_SHARED_EXPERT_GATE_UP_EARLY_LOGGED
+        if gate_up_early and not _PREFILL_SHARED_EXPERT_GATE_UP_EARLY_LOGGED:
+            logger.info(
+                "Enable DSV4 shared expert gate_up_proj EARLY start: "
+                "num_tokens=%d min_tokens=%d", num_tokens,
+                _PREFILL_SHARED_EXPERT_GATE_UP_EARLY_MIN_TOKENS)
+            _PREFILL_SHARED_EXPERT_GATE_UP_EARLY_LOGGED = True
+
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
             # Only used for int quantization
             if self.quant_type == QuantType.W8A8 or self.quant_type == QuantType.W4A8:
@@ -737,8 +771,10 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
                 # Execute the gate projection and activation concurrently with the
-                # dispatch communication.
-                maybe_wait_event(fused_moe_evts.before_dispatch)
+                # dispatch communication. When gate_up_early=1 we skip the
+                # before_dispatch wait so the matmul overlaps the routed AG.
+                if not gate_up_early:
+                    maybe_wait_event(fused_moe_evts.before_dispatch)
                 hidden_states = torch_npu.npu_quant_matmul(
                     quantized_x,
                     self._shared_experts.gate_up_proj.weight,
@@ -801,6 +837,88 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out
 
+    def _forward_impl_double_mb(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        before_routed_experts: torch.npu.Event,
+    ):
+        """Scheme B: split tokens into two micro-batches, run both routed
+        passes sequentially on the main stream, and run the shared expert on
+        the side stream bridged by:
+          event 1 = MB0.before_dispatch_evt  (MB1 AG naturally serializes on
+                    the comm stream after MB0 dispatch; the shared expert's
+                    gate_up_proj waits this event so it can overlap MB0 AG.)
+          event 2 = MB1.before_combine_evt   (= b1_unpermute_done: recorded
+                    right before MB1's ReduceScatter; the shared expert's
+                    down_proj waits on this event so the final muls_add does
+                    not race ahead of MB1 unpermute.)
+        """
+        num_tokens = hidden_states.shape[0]
+        mid = num_tokens // 2
+        if mid == 0 or 2 * mid != num_tokens:
+            return None
+
+        hs0, hs1 = hidden_states[:mid], hidden_states[mid:]
+        rl0, rl1 = router_logits[:mid], router_logits[mid:]
+
+        # forward_context.input_ids is the *post-AllGather* full-batch view —
+        # split by ITS own row count, not by the local hidden_states len.
+        fwd_ctx = get_forward_context()
+        full_input_ids = getattr(fwd_ctx, "input_ids", None)
+        if full_input_ids is not None and full_input_ids.shape[0] % 2 == 0:
+            id_mid = full_input_ids.shape[0] // 2
+            input_ids_0, input_ids_1 = full_input_ids[:id_mid], full_input_ids[id_mid:]
+        else:
+            input_ids_0 = input_ids_1 = None
+
+        # --- MB0 routed pass ---
+        if input_ids_0 is not None:
+            prev = set_input_ids_override(input_ids_0)
+        else:
+            prev = None
+        try:
+            mb0 = AscendFusedMoE.forward_impl(
+                self, hidden_states=hs0, router_logits=rl0,
+                return_with_event=True,
+            )
+        finally:
+            if input_ids_0 is not None:
+                reset_input_ids_override(prev)
+
+        # --- MB1 routed pass ---
+        if mb0.before_dispatch_evt is not None:
+            torch.npu.current_stream().wait_event(mb0.before_dispatch_evt)
+        if input_ids_1 is not None:
+            prev = set_input_ids_override(input_ids_1)
+        else:
+            prev = None
+        try:
+            mb1 = AscendFusedMoE.forward_impl(
+                self, hidden_states=hs1, router_logits=rl1,
+                return_with_event=True,
+            )
+        finally:
+            if input_ids_1 is not None:
+                reset_input_ids_override(prev)
+
+        routed_out = torch.cat([mb0.routed_out, mb1.routed_out], dim=0)
+
+        if self._shared_experts is None:
+            return routed_out, None
+
+        shared_out = self._forward_shared_experts(
+            hidden_states,
+            FusedMoEEvents(
+                before_routed_experts=before_routed_experts,
+                before_dispatch=mb0.before_dispatch_evt,        # evt 1
+                before_gmm2=mb0.before_gmm2_evt,
+                before_combine=mb1.before_combine_evt,          # evt 2 (b1_unpermute_done)
+                swiglu_limit=mb0.swiglu_limit,
+            ),
+        )
+        return shared_out, routed_out
+
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
@@ -817,6 +935,30 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             router_logits = F.linear(hidden_states_fp32, self.gate.weight_fp32)
         else:
             before_routed_experts = torch.npu.current_stream().record_event()
+
+        # === Scheme B: dual micro-batch MoE path ===
+        num_tokens = hidden_states.shape[0]
+        use_double_mb = (
+            _PREFILL_DOUBLE_MB_OVERLAP
+            and self.multistream_overlap_shared_expert
+            and not self.multistream_overlap_gate
+            and self._shared_experts is not None
+            and num_tokens >= _PREFILL_DOUBLE_MB_MIN_TOKENS
+            and num_tokens % 2 == 0
+        )
+        if use_double_mb:
+            global _PREFILL_DOUBLE_MB_LOGGED
+            if not _PREFILL_DOUBLE_MB_LOGGED:
+                logger.info(
+                    "Enable DSV4 prefill double-MB MoE overlap (0514): "
+                    "num_tokens=%d min_tokens=%d", num_tokens,
+                    _PREFILL_DOUBLE_MB_MIN_TOKENS)
+                _PREFILL_DOUBLE_MB_LOGGED = True
+            result = self._forward_impl_double_mb(
+                hidden_states, router_logits, before_routed_experts)
+            if result is not None:
+                return result
+            # else fall through to original single-MB path
 
         fused_moe_results = AscendFusedMoE.forward_impl(
             self,

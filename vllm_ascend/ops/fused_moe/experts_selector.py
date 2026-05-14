@@ -22,6 +22,37 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
+# Optional override for the input_ids that the fusion kernel reads. Used by the
+# Prefill double-microbatch path in fused_moe.py to feed each MB its own slice
+# of input_ids without modifying forward_context globally. Plain module-level
+# global since contextvars did not propagate reliably across compiled-graph
+# boundaries on Ascend NPU.
+_input_ids_override_value = None
+
+
+def set_input_ids_override(input_ids):
+    """Returns the previous value so the caller can restore it."""
+    global _input_ids_override_value
+    prev = _input_ids_override_value
+    _input_ids_override_value = input_ids
+    import os as _os
+    if _os.getenv("VLLM_ASCEND_DBG_OVERRIDE", "0") == "1":
+        from vllm.logger import logger as _lg
+        import sys as _sys
+        _lg.info("[DBG set] shape=%s id(mod)=%s",
+                 tuple(input_ids.shape) if input_ids is not None else None,
+                 id(_sys.modules[__name__]))
+    return prev
+
+
+def reset_input_ids_override(prev):
+    global _input_ids_override_value
+    _input_ids_override_value = prev
+
+
+def _get_input_ids_override():
+    return _input_ids_override_value
+
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 
@@ -233,7 +264,22 @@ def _select_experts_with_fusion_ops(
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
             forward_context = get_forward_context()
-            input_ids = forward_context.input_ids.to(torch.int64)
+            override = _input_ids_override_value
+            import os as _os
+            if _os.getenv("VLLM_ASCEND_DBG_OVERRIDE", "0") == "1":
+                from vllm.logger import logger as _lg
+                import sys as _sys
+                _lg.info(
+                    "[DBG override] override=%s fwd_ids_shape=%s rlogits=%s id(mod)=%s",
+                    None if override is None else tuple(override.shape),
+                    tuple(forward_context.input_ids.shape) if forward_context.input_ids is not None else None,
+                    tuple(router_logits.shape),
+                    id(_sys.modules[__name__]),
+                )
+            if override is not None:
+                input_ids = override.to(torch.int64)
+            else:
+                input_ids = forward_context.input_ids.to(torch.int64)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
