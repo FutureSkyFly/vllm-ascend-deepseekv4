@@ -90,6 +90,24 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.multistream_dsa_preprocess = additional_config.get(
             "multistream_dsa_preprocess", False)
+        cv_parallel_config = additional_config.get("cv_parallel_config", {})
+        cv_parallel_default = bool(
+            additional_config.get("cv_parallel", False)
+            or additional_config.get("enable_cv_parallel", False)
+        )
+        # `cv_parallel` means the safe C/V overlap by default: run the main
+        # compressed-KV C path against the normal V/Q path. MLA and indexer
+        # side paths are separate experimental knobs because MLA can introduce
+        # V/V competition and indexer_select_qli contains its own compressor.
+        self.cv_parallel_mla_prolog = bool(additional_config.get(
+            "cv_parallel_mla_prolog",
+            cv_parallel_config.get("mla_prolog", False)))
+        self.cv_parallel_index_prolog = bool(additional_config.get(
+            "cv_parallel_index_prolog",
+            cv_parallel_config.get("index_prolog", False)))
+        self.cv_parallel_kv_compressor = bool(additional_config.get(
+            "cv_parallel_kv_compressor",
+            cv_parallel_config.get("kv_compressor", cv_parallel_default)))
 
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1

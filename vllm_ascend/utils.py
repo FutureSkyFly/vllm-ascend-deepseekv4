@@ -61,6 +61,9 @@ _WEIGHT_PREFETCH_METHOD = None
 _GLOBAL_STREAM = None
 _SHARED_EXPERTS_CALCULATION_STREAM = None
 _CP_CHUNKEDPREFILL_COMM_STREAM = None
+_CV_MLA_PROLOG_STREAM = None
+_CV_INDEX_PROLOG_STREAM = None
+_CV_KV_COMPRESSOR_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
@@ -80,7 +83,6 @@ def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
     from vllm.model_executor.models.utils import extract_layer_index
 
     layer_idx = extract_layer_index(layer_name)
-    # TODO(zzzzwwjj): the layer idx of mtp should be aligned with vLLM
     if ".mtp." in f".{layer_name}." and layer_idx < config.num_hidden_layers:
         return config.num_hidden_layers + layer_idx
     return layer_idx
@@ -456,6 +458,27 @@ def attention_calculation_stream() -> torch.npu.Stream:
         _ATNN_CALCULATION_STREAM = torch_npu.npu.Stream()
     return _ATNN_CALCULATION_STREAM
 
+
+def cv_mla_prolog_stream() -> torch.npu.Stream:
+    global _CV_MLA_PROLOG_STREAM
+    if _CV_MLA_PROLOG_STREAM is None:
+        _CV_MLA_PROLOG_STREAM = torch_npu.npu.Stream()
+    return _CV_MLA_PROLOG_STREAM
+
+
+def cv_index_prolog_stream() -> torch.npu.Stream:
+    global _CV_INDEX_PROLOG_STREAM
+    if _CV_INDEX_PROLOG_STREAM is None:
+        _CV_INDEX_PROLOG_STREAM = torch_npu.npu.Stream()
+    return _CV_INDEX_PROLOG_STREAM
+
+
+def cv_kv_compressor_stream() -> torch.npu.Stream:
+    global _CV_KV_COMPRESSOR_STREAM
+    if _CV_KV_COMPRESSOR_STREAM is None:
+        _CV_KV_COMPRESSOR_STREAM = torch_npu.npu.Stream()
+    return _CV_KV_COMPRESSOR_STREAM
+
 def adapt_patch(is_global_patch: bool = False):
     if is_global_patch:
         from vllm_ascend.patch import platform  # noqa: F401
@@ -584,12 +607,30 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     )
 
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
+        additional_config = vllm_config.additional_config or {}
+        cv_parallel_config = additional_config.get("cv_parallel_config", {})
+        cv_parallel_default = bool(
+            additional_config.get("cv_parallel", False)
+            or additional_config.get("enable_cv_parallel", False)
+        )
+        cv_parallel_streams = sum((
+            int(additional_config.get(
+                "cv_parallel_mla_prolog",
+                cv_parallel_config.get("mla_prolog", False))),
+            int(additional_config.get(
+                "cv_parallel_index_prolog",
+                cv_parallel_config.get("index_prolog", False))),
+            int(additional_config.get(
+                "cv_parallel_kv_compressor",
+                cv_parallel_config.get("kv_compressor", cv_parallel_default))),
+        ))
         # TODO: Find out whether we need to take into account the pp_size
         parallel_factor = (
             1
             + num_comm_groups
             + int(parallel_config.enable_expert_parallel)
-            + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
+            + int(additional_config.get("multistream_overlap_shared_expert", False))
+            + cv_parallel_streams
         )
         if is_moe_model(vllm_config):
             parallel_factor += parallel_config.data_parallel_size > 1

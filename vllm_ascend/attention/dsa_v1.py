@@ -29,6 +29,8 @@ from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (AscendDeviceType, attention_calculation_stream,
+                               cv_index_prolog_stream,
+                               cv_kv_compressor_stream, cv_mla_prolog_stream,
                                get_ascend_device_type, npu_stream_switch, get_dsv4_compress_ratio, extract_dsv4_layer_index,
                                olora_tp_enable)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -1109,6 +1111,17 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.multistream_dsa_preprocess = ascend_config.multistream_dsa_preprocess
+        self.cv_parallel_mla_prolog = ascend_config.cv_parallel_mla_prolog
+        self.cv_parallel_index_prolog = ascend_config.cv_parallel_index_prolog
+        self.cv_parallel_kv_compressor = ascend_config.cv_parallel_kv_compressor
+        if (self.cv_parallel_mla_prolog or self.cv_parallel_index_prolog
+                or self.cv_parallel_kv_compressor):
+            logger.info_once(
+                "DSA CV parallel enabled: mla_prolog=%s, index_prolog=%s, kv_compressor=%s",
+                self.cv_parallel_mla_prolog,
+                self.cv_parallel_index_prolog,
+                self.cv_parallel_kv_compressor,
+            )
 
         self.vllm_config = get_current_vllm_config()
 
@@ -1167,6 +1180,143 @@ class AscendDSAImpl(DSAAttentionImpl):
         else:
             x = x_rot.reshape(1, num_tokens, -1, rotary_dim)
         return x
+
+    def _project_swa_kv(self, hidden_states: torch.Tensor):
+        return self.wkv(hidden_states)
+
+    @staticmethod
+    def _record_tensor_stream(tensor: torch.Tensor | None,
+                              stream: torch.npu.Stream) -> None:
+        if tensor is not None:
+            tensor.record_stream(stream)
+
+    def _record_tensors_stream(self, stream: torch.npu.Stream,
+                               *tensors: torch.Tensor | None) -> None:
+        for tensor in tensors:
+            self._record_tensor_stream(tensor, stream)
+
+    def _finish_swa_kv(self, kv: torch.Tensor,
+                       cos: torch.Tensor, sin: torch.Tensor):
+        kv = self.kv_norm(kv)
+        assert self.rope_head_dim is not None
+        kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            kv.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        return kv
+
+    def _build_swa_kv(self, hidden_states: torch.Tensor,
+                      cos: torch.Tensor, sin: torch.Tensor):
+        kv = self._project_swa_kv(hidden_states)
+        return self._finish_swa_kv(kv, cos, sin)
+
+    def _scatter_swa_kv(self, swa_kv_cache: torch.Tensor,
+                        slot_mapping: torch.Tensor, kv: torch.Tensor):
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            swa_kv_cache,
+            slot_mapping,
+            kv)
+
+    def _run_swa_kv_prolog(self, hidden_states: torch.Tensor,
+                           cos: torch.Tensor, sin: torch.Tensor,
+                           swa_kv_cache: torch.Tensor,
+                           slot_mapping: torch.Tensor):
+        kv = self._build_swa_kv(hidden_states, cos, sin)
+        self._scatter_swa_kv(swa_kv_cache, slot_mapping, kv)
+
+    def _build_compressed_kv(
+        self,
+        hidden_states: torch.Tensor,
+        state_cache: torch.Tensor,
+        compressor_state_stage_metadata,
+        common_stage_metadata,
+        compress_sin: torch.Tensor,
+        compress_cos: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        *,
+        empty_to_none: bool = False,
+    ):
+        coff = 2 if self.compressor_overlap else 1
+        compressed_kv = torch.ops._C_ascend.compressor(
+            hidden_states,
+            self.compressor_wkv.weight,
+            self.compressor_wgate.weight,
+            state_cache.squeeze(-2),
+            self.compressor_ape,
+            self.compressor_norm.weight,
+            compress_sin.view(-1, compress_sin.shape[-1]),
+            compress_cos.view(-1, compress_cos.shape[-1]),
+            state_block_table=compressor_state_stage_metadata.block_table,
+            cu_seqlens=actual_seq_lengths_query,
+            seqused=None,
+            start_pos=common_stage_metadata.start_pos,
+            rope_head_dim=self.rope_head_dim,
+            cmp_ratio=self.compress_ratio,
+            coff=coff,
+            norm_eps=self.compressor_norm_eps,
+            rotary_mode=2,
+            cache_mode=1)
+
+        if empty_to_none and compressed_kv.numel() == 0:
+            compressed_kv = None
+
+        return compressed_kv
+
+    def _scatter_compressed_kv(self, compress_kv_cache: torch.Tensor,
+                               slot_mapping: torch.Tensor,
+                               compressed_kv: torch.Tensor):
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            compress_kv_cache,
+            slot_mapping,
+            compressed_kv)
+
+    def _run_kv_compressor_and_scatter(
+        self,
+        hidden_states: torch.Tensor,
+        compress_kv_cache: torch.Tensor,
+        state_cache: torch.Tensor,
+        compressor_stage_metadata,
+        compressor_state_stage_metadata,
+        common_stage_metadata,
+        compress_sin: torch.Tensor,
+        compress_cos: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        *,
+        empty_to_none: bool = False,
+    ):
+        compressed_kv = self._build_compressed_kv(
+            hidden_states,
+            state_cache,
+            compressor_state_stage_metadata,
+            common_stage_metadata,
+            compress_sin,
+            compress_cos,
+            actual_seq_lengths_query,
+            empty_to_none=empty_to_none)
+        self._scatter_compressed_kv(compress_kv_cache,
+                                    compressor_stage_metadata.slot_mapping,
+                                    compressed_kv)
+
+    def _finish_parallel_kv_compressor(
+        self,
+        compressor_stream: torch.npu.Stream | None,
+        compressed_kv: torch.Tensor | None,
+        compress_kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if compressor_stream is None:
+            return
+        torch.npu.current_stream().wait_stream(compressor_stream)
+        if compressed_kv is None:
+            return
+        self._record_tensor_stream(compressed_kv, torch.npu.current_stream())
+        self._scatter_compressed_kv(compress_kv_cache, slot_mapping,
+                                    compressed_kv)
 
     def forward(  # type: ignore[override]
         self,
@@ -1281,43 +1431,37 @@ class AscendDSAImpl(DSAAttentionImpl):
         actual_seq_lengths_query = compress_common_attn_metadata.prefill.query_start_loc
         actual_seq_lengths_key = compress_common_attn_metadata.prefill.seq_lens
 
-        # mlaprolog
-        # q
-        qr = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q = triton_q_rms(q, self.eps)
-
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            q.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        # win kv & tok_dis
-        kv = self.wkv(hidden_states)
-        kv = self.kv_norm(kv)
-        assert self.rope_head_dim is not None
-        kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            kv.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-
-        # swa exec kv
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(
-            swa_kv_cache,
-            swa_metadata.prefill.slot_mapping, kv)
-
         compress_cos = compress_common_attn_metadata.prefill.compress_cos[layer_name]
         compress_sin = compress_common_attn_metadata.prefill.compress_sin[layer_name]
-        if self.compress_ratio > 1:
-            compress_topk_idxs = None
-            if self.compress_ratio == 4:
+
+        main_stream = torch.npu.current_stream()
+        mla_stream = None
+        index_stream = None
+        compressor_stream = None
+        compressed_kv = None
+        compress_topk_idxs = None
+        kv_compressor_cv_enabled = (
+            self.compress_ratio > 1 and self.cv_parallel_kv_compressor)
+        index_prolog_cv_enabled = (
+            self.cv_parallel_index_prolog and self.compress_ratio == 4
+            and not kv_compressor_cv_enabled)
+
+        if self.cv_parallel_mla_prolog:
+            mla_stream = cv_mla_prolog_stream()
+            mla_stream.wait_stream(main_stream)
+            self._record_tensor_stream(hidden_states, mla_stream)
+            with npu_stream_switch(mla_stream, enabled=True):
+                kv = self._project_swa_kv(hidden_states)
+
+        qr = self.q_norm(self.wq_a(hidden_states))
+        if index_prolog_cv_enabled:
+            index_stream = cv_index_prolog_stream()
+            index_stream.wait_stream(main_stream)
+            self._record_tensors_stream(
+                index_stream, hidden_states, qr, cos, sin, compress_cos,
+                compress_sin, actual_seq_lengths_query,
+                actual_seq_lengths_key)
+            with npu_stream_switch(index_stream, enabled=True):
                 compress_topk_idxs = self.indexer_select_qli(
                     x=hidden_states,
                     qr=qr,
@@ -1331,39 +1475,87 @@ class AscendDSAImpl(DSAAttentionImpl):
                     actual_seq_lengths_key=actual_seq_lengths_key,
                     with_prefill=True)
 
-            coff = 2 if self.compressor_overlap else 1
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = triton_q_rms(q, self.eps)
 
-            # compressor
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                # TODO(yilin): adapt to the latest operator
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                # TODO(lxs): adapt the block table
-                state_block_table=compressor_kv_state_metadata.prefill.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=compress_common_attn_metadata.prefill.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
 
-            if compressed_kv.numel() == 0:
-                compressed_kv = None
+        if kv_compressor_cv_enabled:
+            compressor_stream = cv_kv_compressor_stream()
+            compressor_stream.wait_stream(main_stream)
+            self._record_tensors_stream(
+                compressor_stream, hidden_states, state_cache, compress_sin,
+                compress_cos, actual_seq_lengths_query)
+            with npu_stream_switch(compressor_stream, enabled=True):
+                compressed_kv = self._build_compressed_kv(
+                    hidden_states,
+                    state_cache,
+                    compressor_kv_state_metadata.prefill,
+                    compress_common_attn_metadata.prefill,
+                    compress_sin,
+                    compress_cos,
+                    actual_seq_lengths_query,
+                    empty_to_none=True)
 
-            # kv_compress_epilog
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                compress_kv_cache,
-                compressor_attn_metadata.prefill.slot_mapping,
-                compressed_kv)
+        if self.cv_parallel_mla_prolog:
+            main_stream.wait_stream(mla_stream)
+            self._record_tensor_stream(kv, main_stream)
+            kv = self._finish_swa_kv(kv, cos, sin)
+            self._scatter_swa_kv(swa_kv_cache, swa_metadata.prefill.slot_mapping, kv)
+        else:
+            self._run_swa_kv_prolog(hidden_states, cos, sin, swa_kv_cache,
+                                    swa_metadata.prefill.slot_mapping)
+
+        if self.compress_ratio > 1:
+            if self.compress_ratio == 4:
+                # indexer_select_qli includes a second compressor and indexer
+                # cache scatter. Finish the main C-path first to avoid C/C
+                # stream competition disguised as CV overlap.
+                if kv_compressor_cv_enabled:
+                    self._finish_parallel_kv_compressor(
+                        compressor_stream, compressed_kv, compress_kv_cache,
+                        compressor_attn_metadata.prefill.slot_mapping)
+                    compressor_stream = None
+                    compressed_kv = None
+                if index_prolog_cv_enabled:
+                    main_stream.wait_stream(index_stream)
+                    self._record_tensor_stream(compress_topk_idxs, main_stream)
+                else:
+                    compress_topk_idxs = self.indexer_select_qli(
+                        x=hidden_states,
+                        qr=qr,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=cos,
+                        sin=sin,
+                        compressed_cos=compress_cos,
+                        compressed_sin=compress_sin,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        with_prefill=True)
+
+            if kv_compressor_cv_enabled:
+                self._finish_parallel_kv_compressor(
+                    compressor_stream, compressed_kv, compress_kv_cache,
+                    compressor_attn_metadata.prefill.slot_mapping)
+            else:
+                self._run_kv_compressor_and_scatter(
+                    hidden_states,
+                    compress_kv_cache,
+                    state_cache,
+                    compressor_attn_metadata.prefill,
+                    compressor_kv_state_metadata.prefill,
+                    compress_common_attn_metadata.prefill,
+                    compress_sin,
+                    compress_cos,
+                    actual_seq_lengths_query,
+                    empty_to_none=True)
 
         if self.compress_ratio <= 1:
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
@@ -1459,6 +1651,28 @@ class AscendDSAImpl(DSAAttentionImpl):
         actual_seq_lengths_key = compress_common_attn_metadata.decode.seq_lens
         wait_hidden_state_cal_event = torch.npu.current_stream().record_event() \
             if self.multistream_dsa_preprocess else None
+        main_stream = torch.npu.current_stream()
+        mla_stream = None
+        index_stream = None
+        compressor_stream = None
+        compressed_kv = None
+        compress_topk_idxs = None
+        kv_compressor_cv_enabled = (
+            self.compress_ratio > 1 and self.cv_parallel_kv_compressor)
+        index_prolog_cv_enabled = (
+            self.cv_parallel_index_prolog and self.compress_ratio == 4
+            and not kv_compressor_cv_enabled)
+
+        if self.compress_ratio > 1:
+            compress_cos = compress_common_attn_metadata.decode.compress_cos[layer_name]
+            compress_sin = compress_common_attn_metadata.decode.compress_sin[layer_name]
+
+        if self.cv_parallel_mla_prolog:
+            mla_stream = cv_mla_prolog_stream()
+            mla_stream.wait_stream(main_stream)
+            self._record_tensor_stream(hidden_states, mla_stream)
+            with npu_stream_switch(mla_stream, enabled=True):
+                kv = self._project_swa_kv(hidden_states)
 
         # q
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and \
@@ -1478,53 +1692,14 @@ class AscendDSAImpl(DSAAttentionImpl):
             qr = q = self.q_norm(self.wq_a(hidden_states))
             q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
             qr_pertoken_scale = None
-
-        q = triton_q_rms(q, self.eps)
-
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            q.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-
-        with npu_stream_switch(attention_calculation_stream(),
-                               enabled=self.multistream_dsa_preprocess):
-            if wait_hidden_state_cal_event:
-                torch.npu.current_stream().wait_event(
-                    wait_hidden_state_cal_event)
-
-            # win kv & tok_dis
-            kv = self.wkv(hidden_states)
-            kv = self.kv_norm(kv)
-            assert self.rope_head_dim is not None
-            kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-
-            torch.ops._C_ascend.inplace_partial_rotary_mul(
-                kv.unsqueeze(1),
-                cos,
-                sin,
-                rotary_mode="interleave",
-                partial_slice=[self.nope_head_dim, self.head_dim],
-            )
-
-            # swa exec kv
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                swa_kv_cache,
-                swa_metadata.decode.slot_mapping, kv)
-
-            wait_attention_cal_event = torch.npu.current_stream().record_event() \
-                if self.multistream_dsa_preprocess else None
-
-        if wait_attention_cal_event:
-            torch.npu.current_stream().wait_event(wait_attention_cal_event)
-
-        if self.compress_ratio > 1:
-            compress_cos = compress_common_attn_metadata.decode.compress_cos[layer_name]
-            compress_sin = compress_common_attn_metadata.decode.compress_sin[layer_name]
-            compress_topk_idxs = None
-            if self.compress_ratio == 4:
+        if index_prolog_cv_enabled:
+            index_stream = cv_index_prolog_stream()
+            index_stream.wait_stream(main_stream)
+            self._record_tensors_stream(
+                index_stream, hidden_states, qr, cos, sin, compress_cos,
+                compress_sin, actual_seq_lengths_query,
+                actual_seq_lengths_key, qr_pertoken_scale)
+            with npu_stream_switch(index_stream, enabled=True):
                 compress_topk_idxs = self.indexer_select_qli(
                     x=hidden_states,
                     qr=qr,
@@ -1539,33 +1714,97 @@ class AscendDSAImpl(DSAAttentionImpl):
                     with_prefill=False,
                     qr_pertoken_scale=qr_pertoken_scale)
 
-            coff = 2 if self.compressor_overlap else 1
+        q = triton_q_rms(q, self.eps)
 
-            # compressor
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                state_block_table=compressor_kv_state_metadata.decode.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=compress_common_attn_metadata.decode.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1)
-            # kv_compress_epilog
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                compress_kv_cache,
-                compressor_attn_metadata.decode.slot_mapping,
-                compressed_kv)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+
+        if kv_compressor_cv_enabled:
+            compressor_stream = cv_kv_compressor_stream()
+            compressor_stream.wait_stream(main_stream)
+            self._record_tensors_stream(
+                compressor_stream, hidden_states, state_cache, compress_sin,
+                compress_cos, actual_seq_lengths_query)
+            with npu_stream_switch(compressor_stream, enabled=True):
+                compressed_kv = self._build_compressed_kv(
+                    hidden_states,
+                    state_cache,
+                    compressor_kv_state_metadata.decode,
+                    compress_common_attn_metadata.decode,
+                    compress_sin,
+                    compress_cos,
+                    actual_seq_lengths_query)
+
+        if self.cv_parallel_mla_prolog:
+            main_stream.wait_stream(mla_stream)
+            self._record_tensor_stream(kv, main_stream)
+            kv = self._finish_swa_kv(kv, cos, sin)
+            self._scatter_swa_kv(swa_kv_cache, swa_metadata.decode.slot_mapping, kv)
+        else:
+            with npu_stream_switch(attention_calculation_stream(),
+                                   enabled=self.multistream_dsa_preprocess):
+                if wait_hidden_state_cal_event:
+                    torch.npu.current_stream().wait_event(
+                        wait_hidden_state_cal_event)
+
+                self._run_swa_kv_prolog(hidden_states, cos, sin, swa_kv_cache,
+                                        swa_metadata.decode.slot_mapping)
+
+                wait_attention_cal_event = torch.npu.current_stream().record_event() \
+                    if self.multistream_dsa_preprocess else None
+
+            if wait_attention_cal_event:
+                torch.npu.current_stream().wait_event(wait_attention_cal_event)
+
+        if self.compress_ratio > 1:
+            if self.compress_ratio == 4:
+                # indexer_select_qli runs its own compressor for indexer K.
+                # Do not overlap it with the main compressed-KV compressor.
+                if kv_compressor_cv_enabled:
+                    self._finish_parallel_kv_compressor(
+                        compressor_stream, compressed_kv, compress_kv_cache,
+                        compressor_attn_metadata.decode.slot_mapping)
+                    compressor_stream = None
+                    compressed_kv = None
+                if index_prolog_cv_enabled:
+                    main_stream.wait_stream(index_stream)
+                    self._record_tensor_stream(compress_topk_idxs, main_stream)
+                else:
+                    compress_topk_idxs = self.indexer_select_qli(
+                        x=hidden_states,
+                        qr=qr,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=cos,
+                        sin=sin,
+                        compressed_cos=compress_cos,
+                        compressed_sin=compress_sin,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        with_prefill=False,
+                        qr_pertoken_scale=qr_pertoken_scale)
+
+            if kv_compressor_cv_enabled:
+                self._finish_parallel_kv_compressor(
+                    compressor_stream, compressed_kv, compress_kv_cache,
+                    compressor_attn_metadata.decode.slot_mapping)
+            else:
+                self._run_kv_compressor_and_scatter(
+                    hidden_states,
+                    compress_kv_cache,
+                    state_cache,
+                    compressor_attn_metadata.decode,
+                    compressor_kv_state_metadata.decode,
+                    compress_common_attn_metadata.decode,
+                    compress_sin,
+                    compress_cos,
+                    actual_seq_lengths_query)
+
         if self.compress_ratio <= 1:
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                 q,
